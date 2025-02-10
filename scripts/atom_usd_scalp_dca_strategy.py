@@ -1,8 +1,7 @@
-import logging
 from decimal import Decimal
 from typing import Dict, List
 
-from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.event.events import OrderFilledEvent
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
@@ -36,7 +35,7 @@ class AtomUsdScalpDCAStrategy(ScriptStrategyBase):
     
     def on_start(self):
         self.ready = True
-        self.logger().info("Strategy started - Trading ATOM-USD with DCA and dynamic basis adjustment")
+        self.logger().info(f"Strategy started - Trading ATOM-USD with DCA and dynamic basis adjustment")
         self.logger().info(f"Initial parameters: Max order size=${self.max_order_amount_usd}, "
                         f"Profit target={self.min_profitability*100}%, Max positions={self.max_positions}")
     
@@ -96,7 +95,7 @@ class AtomUsdScalpDCAStrategy(ScriptStrategyBase):
         self.logger().info(f"Checking for new buy opportunities - Available USD: ${available_balance}")
         
         if available_balance < self.max_order_amount_usd:
-            self.logger().info("Insufficient balance for new positions")
+            self.logger().info(f"Insufficient balance for new positions")
             return
         
         buy_price = current_price * Decimal("0.999")
@@ -143,7 +142,7 @@ class AtomUsdScalpDCAStrategy(ScriptStrategyBase):
                     self.logger().info(f"Consolidating position - Removing entry at ${price}")
                     del self.dca_positions[price]
             
-            self.logger().info("Cancelling existing sell orders to update targets")
+            self.logger().info(f"Cancelling existing sell orders to update targets")
             self.cancel_all_orders()
             
             self.active_buy_orders = [
@@ -161,7 +160,7 @@ class AtomUsdScalpDCAStrategy(ScriptStrategyBase):
                     self.total_position_value -= sold_amount * Decimal(str(price))
                     
                     if self.total_position_amount <= Decimal("0"):
-                        self.logger().info("Position fully closed - Resetting tracking variables")
+                        self.logger().info(f"Position fully closed - Resetting tracking variables")
                         self.total_position_amount = Decimal("0")
                         self.total_position_value = Decimal("0")
                         del self.dca_positions[price]
