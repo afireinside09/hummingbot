@@ -49,8 +49,8 @@ class SmartScalpingDCA(ScriptStrategyBase):
         self.config = config
         self.create_timestamp = 0
         self.positions = deque(maxlen=self.config.max_positions)
-        self.maker_fee = Decimal("0.0007")  # 0.07%
-        self.taker_fee = Decimal("0.0121")  # 1.21%
+        self.maker_fee = Decimal("0.0006")  # 0.06%
+        self.taker_fee = Decimal("0.0120")  # 1.20%
         self.logger().info("Strategy initialized with config: %s", vars(config))
         
     @classmethod
@@ -142,70 +142,53 @@ class SmartScalpingDCA(ScriptStrategyBase):
         
         cost_basis = self.calculate_cost_basis()
         
-        # Calculate buy orders
+        # First priority: Create sell orders for existing positions
+        if cost_basis is not None and self.positions:
+            min_profitable_price = cost_basis * (
+                Decimal("1") + self.config.min_profitability + self.maker_fee + self.taker_fee
+            )
+            total_position_amount = sum(amount for _, amount in self.positions)
+            self.logger().info("Creating sell order at price %s (cost basis: %s) for total amount %s", 
+                            float(min_profitable_price), float(cost_basis), float(total_position_amount))
+            sell_order = OrderCandidate(
+                trading_pair=self.config.trading_pair,
+                is_maker=True,
+                order_type=OrderType.LIMIT,
+                order_side=TradeType.SELL,
+                amount=total_position_amount,
+                price=min_profitable_price
+            )
+            proposal.append(sell_order)
+            return proposal  # Return early - don't place buy orders while we have positions to sell
+        
+        # Second priority: Place buy orders only if price has dropped enough
         if len(self.positions) < self.config.max_positions:
-            positions_to_add = self.config.max_positions - len(self.positions)
+            lowest_price = None
+            if self.positions:
+                lowest_price = min(price for price, _ in self.positions)
+                target_buy_price = lowest_price * (Decimal("1") - self.config.position_distance)
+                self.logger().info("Lowest position price: %s, target buy price: %s", 
+                                float(lowest_price), float(target_buy_price))
+            else:
+                target_buy_price = current_price * (Decimal("1") - self.config.position_distance)
+                self.logger().info("No positions - target buy price: %s", float(target_buy_price))
             
-            # If we have no positions, place the first buy order
-            if not self.positions:
-                self.logger().info("No positions - Creating initial buy order")
+            # Only place buy order if current price is at or below target price
+            if current_price <= target_buy_price:
+                self.logger().info("Current price %s at or below target %s - creating buy order", 
+                                float(current_price), float(target_buy_price))
                 buy_order = OrderCandidate(
                     trading_pair=self.config.trading_pair,
                     is_maker=True,
                     order_type=OrderType.LIMIT,
                     order_side=TradeType.BUY,
                     amount=self.config.order_amount,
-                    price=current_price * (Decimal("1") - self.config.position_distance)
+                    price=current_price
                 )
                 proposal.append(buy_order)
-                self.logger().info("Creating first buy order at price %s", float(buy_order.price))
-            
-            # Only DCA if current price is below cost basis
-            elif cost_basis is not None and current_price < cost_basis:
-                self.logger().info("Price below cost basis - Creating %d DCA orders", positions_to_add)
-                lowest_position_price = min(price for price, _ in self.positions)
-                
-                for i in range(positions_to_add):
-                    # Calculate new buy price below the lowest position
-                    buy_price = lowest_position_price * (Decimal("1") - self.config.position_distance * (i + 1))
-                    
-                    # Only add order if it would improve our average position
-                    weighted_average = (cost_basis * sum(amount for _, amount in self.positions) + 
-                                     buy_price * self.config.order_amount) / (
-                                         sum(amount for _, amount in self.positions) + self.config.order_amount)
-                    
-                    if weighted_average < cost_basis:
-                        self.logger().info("Creating DCA buy order %d at price %s (improves average from %s to %s)", 
-                                         i + 1, float(buy_price), float(cost_basis), float(weighted_average))
-                        buy_order = OrderCandidate(
-                            trading_pair=self.config.trading_pair,
-                            is_maker=True,
-                            order_type=OrderType.LIMIT,
-                            order_side=TradeType.BUY,
-                            amount=self.config.order_amount,
-                            price=buy_price
-                        )
-                        proposal.append(buy_order)
-                    else:
-                        self.logger().info("Skipping DCA order at price %s as it would not improve average", 
-                                         float(buy_price))
-
-        # Calculate sell orders based on positions
-        if cost_basis is not None:
-            min_profitable_price = cost_basis * (
-                Decimal("1") + self.config.min_profitability + self.maker_fee + self.taker_fee
-            )
-            self.logger().info("Creating sell order at price %s (cost basis: %s)", 
-                            float(min_profitable_price), float(cost_basis))
-            sell_order = OrderCandidate(
-                trading_pair=self.config.trading_pair,
-                is_maker=True,
-                order_type=OrderType.LIMIT,
-                order_side=TradeType.SELL,
-                amount=sum(amount for _, amount in self.positions),
-                price=min_profitable_price
-            )
-            proposal.append(sell_order)
+            else:
+                self.logger().info("Current price %s above target %s - no buy orders", 
+                                float(current_price), float(target_buy_price))
 
         return proposal
 
