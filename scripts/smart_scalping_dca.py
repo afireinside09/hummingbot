@@ -49,12 +49,47 @@ class SmartScalpingDCA(ScriptStrategyBase):
         self.config = config
         self.create_timestamp = 0
         self.positions = deque(maxlen=self.config.max_positions)
-        self.maker_fee = Decimal("0.0007")
+        self.maker_fee = Decimal("0.0007")  # 0.07% maker fee
+        self.taker_fee = Decimal("0.0121")  # 1.21% taker fee
         self.logger().info("Strategy initialized with config: %s", vars(config))
+        self.logger().info(f"Fees - Maker: {float(self.maker_fee * 100)}%, Taker: {float(self.taker_fee * 100)}%")
+        # Initialize positions from existing balance
+        self.initialize_positions_from_balance()
+
+    def initialize_positions_from_balance(self):
+        """Initialize positions based on current balance and position price"""
+        connector = self.connectors[self.config.exchange]
+        base_balance = connector.get_available_balance(self.config.trading_pair.split("-")[0])
         
-    @classmethod
-    def init_markets(cls, config: SmartScalpingDCAConfig):
-        cls.markets = {config.exchange: {config.trading_pair}}
+        if base_balance > Decimal("0"):
+            # Get position information from connector
+            position_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MidPrice)
+            self.logger().info(f"Found existing balance: {base_balance} at estimated price: {position_price}")
+            
+            # Calculate number of positions based on order_amount
+            num_positions = int(base_balance / self.config.order_amount)
+            remaining_amount = base_balance % self.config.order_amount
+            
+            # Add full positions
+            for _ in range(num_positions):
+                self.positions.append((position_price, self.config.order_amount))
+            
+            # Add remaining amount if significant
+            if remaining_amount > Decimal("0"):
+                self.positions.append((position_price, remaining_amount))
+                
+            self.logger().info(f"Initialized {len(self.positions)} positions from existing balance")
+            cost_basis = self.calculate_cost_basis()
+            if cost_basis:
+                self.logger().info(f"Initial cost basis: {float(cost_basis)}")
+
+    def get_trading_pair_balance(self) -> tuple[Decimal, Decimal]:
+        """Get base and quote balance for the trading pair"""
+        base, quote = self.config.trading_pair.split("-")
+        connector = self.connectors[self.config.exchange]
+        base_balance = connector.get_available_balance(base)
+        quote_balance = connector.get_available_balance(quote)
+        return base_balance, quote_balance
 
     def on_tick(self):
         if self.create_timestamp <= self.current_timestamp:
@@ -93,6 +128,17 @@ class SmartScalpingDCA(ScriptStrategyBase):
         )
         self.logger().info("Current market price: %s", float(current_price))
         
+        # Get current balances
+        base_balance, quote_balance = self.get_trading_pair_balance()
+        self.logger().info(f"Current balances - Base: {float(base_balance)}, Quote: {float(quote_balance)}")
+        
+        # Recalculate positions if they don't match balance
+        total_position_amount = sum(amount for _, amount in self.positions)
+        if abs(total_position_amount - base_balance) > Decimal("1e-10"):
+            self.logger().info("Position amount mismatch detected. Reinitializing positions...")
+            self.positions.clear()
+            self.initialize_positions_from_balance()
+        
         cost_basis = self.calculate_cost_basis()
         
         # Calculate buy orders
@@ -102,16 +148,19 @@ class SmartScalpingDCA(ScriptStrategyBase):
             # If we have no positions, place the first buy order
             if not self.positions:
                 self.logger().info("No positions - Creating initial buy order")
-                buy_order = OrderCandidate(
-                    trading_pair=self.config.trading_pair,
-                    is_maker=True,
-                    order_type=OrderType.LIMIT,
-                    order_side=TradeType.BUY,
-                    amount=self.config.order_amount,
-                    price=current_price * (Decimal("1") - self.config.position_distance)
-                )
-                proposal.append(buy_order)
-                self.logger().info("Creating first buy order at price %s", float(buy_order.price))
+                if quote_balance >= (current_price * self.config.order_amount):
+                    buy_order = OrderCandidate(
+                        trading_pair=self.config.trading_pair,
+                        is_maker=True,
+                        order_type=OrderType.LIMIT,
+                        order_side=TradeType.BUY,
+                        amount=self.config.order_amount,
+                        price=current_price * (Decimal("1") - self.config.position_distance)
+                    )
+                    proposal.append(buy_order)
+                    self.logger().info("Creating first buy order at price %s", float(buy_order.price))
+                else:
+                    self.logger().info(f"Insufficient quote balance ({float(quote_balance)}) for initial position")
             
             # Only DCA if current price is below cost basis
             elif cost_basis is not None and current_price < cost_basis:
@@ -119,8 +168,13 @@ class SmartScalpingDCA(ScriptStrategyBase):
                 lowest_position_price = min(price for price, _ in self.positions)
                 
                 for i in range(positions_to_add):
-                    # Calculate new buy price below the lowest position
+                    # Check if we have enough quote balance for this order
                     buy_price = lowest_position_price * (Decimal("1") - self.config.position_distance * (i + 1))
+                    required_quote = buy_price * self.config.order_amount
+                    
+                    if quote_balance < required_quote:
+                        self.logger().info(f"Insufficient quote balance for DCA order {i+1}")
+                        break
                     
                     # Only add order if it would improve our average position
                     weighted_average = (cost_basis * sum(amount for _, amount in self.positions) + 
@@ -144,19 +198,23 @@ class SmartScalpingDCA(ScriptStrategyBase):
                                          float(buy_price))
 
         # Calculate sell orders based on positions
-        if cost_basis is not None:
+        if cost_basis is not None and base_balance > Decimal("0"):
+            # Include maker fees for both entry and exit
             min_profitable_price = cost_basis * (
                 Decimal("1") + self.config.min_profitability + self.maker_fee * Decimal("2")
             )
-            self.logger().info("Creating sell order at price %s (cost basis: %s)", 
-                            float(min_profitable_price), float(cost_basis))
+            # Add buffer for potential taker fills
+            taker_buffer_price = min_profitable_price * (Decimal("1") + self.taker_fee)
+            
+            self.logger().info("Creating sell order at price %s (cost basis: %s, with taker buffer: %s)", 
+                            float(min_profitable_price), float(cost_basis), float(taker_buffer_price))
             sell_order = OrderCandidate(
                 trading_pair=self.config.trading_pair,
                 is_maker=True,
                 order_type=OrderType.LIMIT,
                 order_side=TradeType.SELL,
-                amount=sum(amount for _, amount in self.positions),
-                price=min_profitable_price
+                amount=base_balance,
+                price=taker_buffer_price  # Use price that ensures profit even with taker fees
             )
             proposal.append(sell_order)
 
@@ -197,13 +255,19 @@ class SmartScalpingDCA(ScriptStrategyBase):
     def did_fill_order(self, event: OrderFilledEvent):
         msg = (
             f"{event.trade_type.name} {round(event.amount, 4)} {event.trading_pair} "
-            f"{self.config.exchange} at {round(event.price, 2)}"
+            f"{self.config.exchange} at {round(event.price, 2)} "
+            f"({'taker' if event.is_taker else 'maker'} fee: "
+            f"{float(self.taker_fee * 100 if event.is_taker else self.maker_fee * 100)}%)"
         )
         
         if event.trade_type == TradeType.BUY:
             self.logger().info("Buy order filled - Adding to positions")
             self.logger().info("Previous positions: %s", list(self.positions))
-            self.positions.append((event.price, event.amount))
+            # Account for fees in position price
+            adjusted_price = event.price * (
+                Decimal("1") + (self.taker_fee if event.is_taker else self.maker_fee)
+            )
+            self.positions.append((adjusted_price, event.amount))
             self.logger().info("Updated positions: %s", list(self.positions))
         else:  # SELL
             self.logger().info("Sell order filled - Clearing all positions")
