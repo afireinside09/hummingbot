@@ -190,6 +190,6 @@ class AtomUsdScalpDCAStrategy(ScriptStrategyBase):
         """Cancel all active orders"""
         for exchange in self.markets:
             for trading_pair in self.markets[exchange]:
-                self.cancel_all(exchange, trading_pair)
+                self.cancel_all_orders_for_trading_pair(exchange, trading_pair)
         self.active_buy_orders = []
         self.active_sell_orders = [] 
