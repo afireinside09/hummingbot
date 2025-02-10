@@ -1,8 +1,8 @@
-from decimal import Decimal
-from typing import List, Dict
 import logging
+from decimal import Decimal
+from typing import Dict, List
 
-from hummingbot.core.data_type.common import PriceType, TradeType, OrderType
+from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.event.events import OrderFilledEvent
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
