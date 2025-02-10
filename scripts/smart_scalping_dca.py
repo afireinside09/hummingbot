@@ -49,7 +49,8 @@ class SmartScalpingDCA(ScriptStrategyBase):
         self.config = config
         self.create_timestamp = 0
         self.positions = deque(maxlen=self.config.max_positions)
-        self.maker_fee = Decimal("0.0007")
+        self.maker_fee = Decimal("0.0007")  # 0.07%
+        self.taker_fee = Decimal("0.0121")  # 1.21%
         self.logger().info("Strategy initialized with config: %s", vars(config))
         
     @classmethod
@@ -146,7 +147,7 @@ class SmartScalpingDCA(ScriptStrategyBase):
         # Calculate sell orders based on positions
         if cost_basis is not None:
             min_profitable_price = cost_basis * (
-                Decimal("1") + self.config.min_profitability + self.maker_fee * Decimal("2")
+                Decimal("1") + self.config.min_profitability + self.maker_fee + self.taker_fee
             )
             self.logger().info("Creating sell order at price %s (cost basis: %s)", 
                             float(min_profitable_price), float(cost_basis))
