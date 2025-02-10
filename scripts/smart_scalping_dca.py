@@ -1,8 +1,8 @@
 import logging
 import os
+from collections import deque
 from decimal import Decimal
 from typing import Dict, List, Optional
-from collections import deque
 
 from pydantic import Field
 
