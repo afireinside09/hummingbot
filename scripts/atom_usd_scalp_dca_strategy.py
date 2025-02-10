@@ -33,14 +33,11 @@ class AtomUsdScalpDCAStrategy(ScriptStrategyBase):
     def __init__(self, connectors: Dict):
         super().__init__(connectors)
         self.ready = False
-        # Set up logger
-        self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.INFO)
     
     def on_start(self):
         self.ready = True
-        self.logger.info("Strategy started - Trading ATOM-USD with DCA and dynamic basis adjustment")
-        self.logger.info(f"Initial parameters: Max order size=${self.max_order_amount_usd}, "
+        self.logger().info("Strategy started - Trading ATOM-USD with DCA and dynamic basis adjustment")
+        self.logger().info(f"Initial parameters: Max order size=${self.max_order_amount_usd}, "
                         f"Profit target={self.min_profitability*100}%, Max positions={self.max_positions}")
     
     def on_stop(self):
@@ -66,17 +63,17 @@ class AtomUsdScalpDCAStrategy(ScriptStrategyBase):
     
     def manage_positions(self, current_price: Decimal):
         """Manage existing positions and place sell orders"""
-        self.logger.info(f"Managing positions - Current price: ${current_price}")
+        self.logger().info(f"Managing positions - Current price: ${current_price}")
         
         # Cancel existing sell orders if price has moved significantly
         for order in self.active_sell_orders:
             if abs(float(order.price) - float(current_price)) / float(current_price) > 0.02:
-                self.logger.info(f"Cancelling outdated sell order at ${order.price} due to price movement")
+                self.logger().info(f"Cancelling outdated sell order at ${order.price} due to price movement")
                 self.cancel(self.exchange, self.trading_pair, order.client_order_id)
         
         for entry_price, amount in list(self.dca_positions.items()):
             target_sell_price = Decimal(entry_price) * (1 + self.min_profitability)
-            self.logger.info(f"Position: {amount} ATOM @ ${entry_price} - Target sell: ${target_sell_price}")
+            self.logger().info(f"Position: {amount} ATOM @ ${entry_price} - Target sell: ${target_sell_price}")
             
             existing_sell = False
             for order in self.active_sell_orders:
@@ -85,7 +82,7 @@ class AtomUsdScalpDCAStrategy(ScriptStrategyBase):
                     break
             
             if not existing_sell:
-                self.logger.info(f"Placing new sell order: {amount} ATOM @ ${target_sell_price}")
+                self.logger().info(f"Placing new sell order: {amount} ATOM @ ${target_sell_price}")
                 self.place_sell_order(
                     self.exchange,
                     self.trading_pair,
@@ -96,28 +93,26 @@ class AtomUsdScalpDCAStrategy(ScriptStrategyBase):
     def place_orders(self, current_price: Decimal):
         """Place new buy orders for DCA"""
         available_balance = self.get_available_balance("USD")
-        self.logger.info(f"Checking for new buy opportunities - Available USD: ${available_balance}")
+        self.logger().info(f"Checking for new buy opportunities - Available USD: ${available_balance}")
         
         if available_balance < self.max_order_amount_usd:
-            self.logger.info("Insufficient balance for new positions")
+            self.logger().info("Insufficient balance for new positions")
             return
         
-        # Calculate buy price slightly below market
         buy_price = current_price * Decimal("0.999")
-        self.logger.info(f"Initial buy price target: ${buy_price} (0.1% below market)")
+        self.logger().info(f"Initial buy price target: ${buy_price} (0.1% below market)")
         
-        # If we have existing positions, implement DCA logic
         if self.dca_positions:
             highest_entry = max(self.dca_positions.keys())
-            self.logger.info(f"Existing position detected - Highest entry: ${highest_entry}")
+            self.logger().info(f"Existing position detected - Highest entry: ${highest_entry}")
             
             if float(current_price) < highest_entry * (1 - float(self.dca_step_size)):
                 buy_price = Decimal(str(highest_entry)) * (1 - self.dca_step_size)
-                self.logger.info(f"DCA opportunity - New buy price: ${buy_price} "
+                self.logger().info(f"DCA opportunity - New buy price: ${buy_price} "
                                f"({self.dca_step_size*100}% below highest entry)")
         
         order_amount = self.max_order_amount_usd / buy_price
-        self.logger.info(f"Placing buy order: {order_amount} ATOM @ ${buy_price}")
+        self.logger().info(f"Placing buy order: {order_amount} ATOM @ ${buy_price}")
         
         self.place_buy_order(
             self.exchange,
@@ -129,14 +124,14 @@ class AtomUsdScalpDCAStrategy(ScriptStrategyBase):
     def did_fill_order(self, event: OrderFilledEvent):
         """Handle order filled events"""
         if event.trade_type == TradeType.BUY:
-            self.logger.info(f"Buy order filled: {event.amount} ATOM @ ${event.price}")
+            self.logger().info(f"Buy order filled: {event.amount} ATOM @ ${event.price}")
             
             position_value = Decimal(str(event.amount)) * Decimal(str(event.price))
             self.total_position_value += position_value
             self.total_position_amount += Decimal(str(event.amount))
             
             avg_entry_price = self.total_position_value / self.total_position_amount
-            self.logger.info(f"Updated position - Total amount: {self.total_position_amount} ATOM, "
+            self.logger().info(f"Updated position - Total amount: {self.total_position_amount} ATOM, "
                            f"Average entry: ${avg_entry_price}")
             
             self.dca_positions[float(avg_entry_price)] = self.total_position_amount
@@ -145,10 +140,10 @@ class AtomUsdScalpDCAStrategy(ScriptStrategyBase):
             entry_prices = list(self.dca_positions.keys())
             for price in entry_prices:
                 if price != float(avg_entry_price):
-                    self.logger.info(f"Consolidating position - Removing entry at ${price}")
+                    self.logger().info(f"Consolidating position - Removing entry at ${price}")
                     del self.dca_positions[price]
             
-            self.logger.info("Cancelling existing sell orders to update targets")
+            self.logger().info("Cancelling existing sell orders to update targets")
             self.cancel_all_orders()
             
             self.active_buy_orders = [
@@ -157,7 +152,7 @@ class AtomUsdScalpDCAStrategy(ScriptStrategyBase):
             ]
             
         else:  # SELL
-            self.logger.info(f"Sell order filled: {event.amount} ATOM @ ${event.price}")
+            self.logger().info(f"Sell order filled: {event.amount} ATOM @ ${event.price}")
             sold_amount = Decimal(str(event.amount))
             
             for price in list(self.dca_positions.keys()):
@@ -166,12 +161,12 @@ class AtomUsdScalpDCAStrategy(ScriptStrategyBase):
                     self.total_position_value -= sold_amount * Decimal(str(price))
                     
                     if self.total_position_amount <= Decimal("0"):
-                        self.logger.info("Position fully closed - Resetting tracking variables")
+                        self.logger().info("Position fully closed - Resetting tracking variables")
                         self.total_position_amount = Decimal("0")
                         self.total_position_value = Decimal("0")
                         del self.dca_positions[price]
                     else:
-                        self.logger.info(f"Partial position close - Remaining: {self.total_position_amount} ATOM")
+                        self.logger().info(f"Partial position close - Remaining: {self.total_position_amount} ATOM")
                         self.dca_positions[price] = self.total_position_amount
                     break
             
