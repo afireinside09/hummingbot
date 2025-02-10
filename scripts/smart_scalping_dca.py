@@ -60,6 +60,28 @@ class SmartScalpingDCA(ScriptStrategyBase):
     def on_tick(self):
         if self.create_timestamp <= self.current_timestamp:
             self.logger().info("------- New Tick Started -------")
+            
+            # Check current balance and update positions if needed
+            connector = self.connectors[self.config.exchange]
+            base_balance = connector.get_available_balance(self.config.trading_pair.split("-")[0])
+            
+            if base_balance == Decimal("0"):
+                if self.positions:
+                    self.logger().info("No balance found - clearing positions")
+                    self.positions.clear()
+            elif not self.positions:
+                # Initialize position with current balance and market price
+                current_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MidPrice)
+                self.positions.append((current_price, base_balance))
+                self.logger().info(f"Initialized position from balance: {base_balance} @ {current_price}")
+            elif abs(base_balance - sum(amount for _, amount in self.positions)) > Decimal("1e-8"):
+                # Balance changed - update position size
+                cost_basis = self.calculate_cost_basis()
+                if cost_basis:
+                    self.positions.clear()
+                    self.positions.append((cost_basis, base_balance))
+                    self.logger().info(f"Updated position to match balance: {base_balance} @ {cost_basis}")
+            
             self.logger().info("Current positions: %s", list(self.positions))
             
             self.cancel_all_orders()
@@ -77,14 +99,38 @@ class SmartScalpingDCA(ScriptStrategyBase):
             self.logger().info("------- Tick Completed -------\n")
 
     def calculate_cost_basis(self) -> Optional[Decimal]:
+        """Calculate cost basis from positions or recent trades"""
         if not self.positions:
             self.logger().info("No positions to calculate cost basis")
             return None
+            
+        # First try from positions
         total_amount = sum(amount for _, amount in self.positions)
         total_value = sum(price * amount for price, amount in self.positions)
-        cost_basis = total_value / total_amount if total_amount > 0 else None
-        self.logger().info("Calculated cost basis: %s", float(cost_basis) if cost_basis else None)
-        return cost_basis
+        
+        if total_amount > 0:
+            cost_basis = total_value / total_amount
+            self.logger().info("Calculated cost basis from positions: %s", float(cost_basis))
+            return cost_basis
+            
+        # If no positions, try from recent trades
+        connector = self.connectors[self.config.exchange]
+        trades = connector.get_my_trades(self.config.trading_pair)
+        
+        buy_value = Decimal("0")
+        buy_amount = Decimal("0")
+        
+        for trade in trades:
+            if trade.trade_type == TradeType.BUY:
+                buy_value += trade.amount * trade.price
+                buy_amount += trade.amount
+        
+        if buy_amount > 0:
+            cost_basis = buy_value / buy_amount
+            self.logger().info("Calculated cost basis from trades: %s", float(cost_basis))
+            return cost_basis
+            
+        return None
 
     def create_proposal(self) -> List[OrderCandidate]:
         proposal = []
