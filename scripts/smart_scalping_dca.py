@@ -62,7 +62,19 @@ class SmartScalpingDCA(ScriptStrategyBase):
         if self.create_timestamp <= self.current_timestamp:
             self.logger().info("------- New Tick Started -------")
             
-            # Check current balance and update positions if needed
+            # Check for active sell orders first
+            active_orders = self.get_active_orders(connector_name=self.config.exchange)
+            active_sells = [o for o in active_orders if not o.is_buy]  # not is_buy means sell order
+            
+            if active_sells:
+                self.logger().info("Active sell orders exist - letting them sit: %s", 
+                                [(o.trading_pair, float(o.price), float(o.quantity)) for o in active_sells])
+                self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
+                self.logger().info("Next tick scheduled for timestamp: %s", self.create_timestamp)
+                self.logger().info("------- Tick Completed (Skipped Due to Active Sells) -------\n")
+                return
+            
+            # No active sells - proceed with normal tick processing
             connector = self.connectors[self.config.exchange]
             base_balance = connector.get_available_balance(self.config.trading_pair.split("-")[0])
             
@@ -85,7 +97,14 @@ class SmartScalpingDCA(ScriptStrategyBase):
             
             self.logger().info("Current positions: %s", list(self.positions))
             
-            self.cancel_all_orders()
+            # Cancel only buy orders, since we know there are no sell orders at this point
+            active_buys = [o for o in active_orders if o.is_buy]
+            if active_buys:
+                self.logger().info("Cancelling %d active buy orders", len(active_buys))
+                for order in active_buys:
+                    self.cancel(self.config.exchange, order.trading_pair, order.client_order_id)
+                    self.logger().info("Cancelled buy order %s", order.client_order_id)
+            
             proposal: List[OrderCandidate] = self.create_proposal()
             self.logger().info("Created proposal: %s", 
                             [(o.order_side, float(o.price), float(o.amount)) for o in proposal])
