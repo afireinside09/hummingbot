@@ -112,9 +112,14 @@ class SmartScalpingDCA(ScriptStrategyBase):
             
             # Skip processing if there are active sell orders
             if self.has_active_sell_orders():
+                # Check for DCA opportunity while sell orders are active
+                dca_order = self.create_dca_order()
+                if dca_order:
+                    self.place_order(self.config.exchange, dca_order)
+                
                 self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
                 self.logger().info("Next tick scheduled for timestamp: %s", self.create_timestamp)
-                self.logger().info("------- Tick Completed (Skipped Due to Active Sells) -------\n")
+                self.logger().info("------- Tick Completed (With DCA Check) -------\n")
                 return
             
             # Update positions based on current balance
@@ -259,48 +264,25 @@ class SmartScalpingDCA(ScriptStrategyBase):
                                 float(total_position_amount), float(self.config.order_amount))
             return proposal  # Return early - don't place buy orders while we have positions to sell
         
-        # Second priority: Place market buy orders when no positions exist
-        if len(self.positions) < self.config.max_positions:
+        # Second priority: Place market buy order only when no positions exist
+        if len(self.positions) == 0:
             # Check available balance for buying
             quote_balance = connector.get_available_balance(self.config.trading_pair.split("-")[1])
             
             # Only proceed if we have enough balance for at least one order_amount
             required_quote = self.config.order_amount * current_price
             if quote_balance >= required_quote:
-                if not self.positions:
-                    # No positions - place market buy order
-                    self.logger().info("No positions - creating market buy order at current price %s", 
-                                    float(current_price))
-                    buy_order = OrderCandidate(
-                        trading_pair=self.config.trading_pair,
-                        is_maker=False,  # Market order
-                        order_type=OrderType.MARKET,
-                        order_side=TradeType.BUY,
-                        amount=self.config.order_amount,
-                        price=current_price
-                    )
-                    proposal.append(buy_order)
-                else:
-                    # Check if price has dropped enough for DCA
-                    highest_position_price = max(price for price, _ in self.positions)
-                    price_drop = (highest_position_price - current_price) / highest_position_price
-                    
-                    if price_drop >= self.config.position_distance:
-                        self.logger().info("Price dropped %.2f%% - creating DCA market buy order at %s", 
-                                        float(price_drop * 100), float(current_price))
-                        buy_order = OrderCandidate(
-                            trading_pair=self.config.trading_pair,
-                            is_maker=False,  # Market order
-                            order_type=OrderType.MARKET,
-                            order_side=TradeType.BUY,
-                            amount=self.config.order_amount,
-                            price=current_price
-                        )
-                        proposal.append(buy_order)
-                    else:
-                        self.logger().info("Price drop %.2f%% insufficient for DCA (need %.2f%%)", 
-                                        float(price_drop * 100), 
-                                        float(self.config.position_distance * 100))
+                self.logger().info("No positions - creating market buy order at current price %s", 
+                                float(current_price))
+                buy_order = OrderCandidate(
+                    trading_pair=self.config.trading_pair,
+                    is_maker=False,  # Market order
+                    order_type=OrderType.MARKET,
+                    order_side=TradeType.BUY,
+                    amount=self.config.order_amount,
+                    price=current_price
+                )
+                proposal.append(buy_order)
             else:
                 self.logger().info("Insufficient quote balance %s (need %s) for order amount %s at price %s", 
                                 float(quote_balance), float(required_quote),
@@ -359,3 +341,70 @@ class SmartScalpingDCA(ScriptStrategyBase):
         
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg) 
+
+    def should_dca_down(self) -> bool:
+        """Check if we should DCA down based on price drop from cost basis."""
+        if not self.positions:
+            return False
+            
+        connector = self.connectors[self.config.exchange]
+        current_price = connector.get_price_by_type(
+            self.config.trading_pair, 
+            PriceType.MidPrice
+        )
+        
+        cost_basis = self.calculate_cost_basis()
+        if not cost_basis:
+            return False
+            
+        price_drop = (cost_basis - current_price) / cost_basis
+        
+        if price_drop >= self.config.position_distance:
+            # Check if we have enough quote balance for another position
+            quote_balance = connector.get_available_balance(self.config.trading_pair.split("-")[1])
+            required_quote = self.config.order_amount * current_price
+            
+            if quote_balance >= required_quote:
+                self.logger().info(
+                    "DCA opportunity: Price dropped %.2f%% from cost basis %s to %s", 
+                    float(price_drop * 100), 
+                    float(cost_basis),
+                    float(current_price)
+                )
+                return True
+            else:
+                self.logger().info(
+                    "DCA skipped: Insufficient balance %s (need %s) despite %.2f%% price drop",
+                    float(quote_balance),
+                    float(required_quote),
+                    float(price_drop * 100)
+                )
+        else:
+            self.logger().info(
+                "Current price drop %.2f%% insufficient for DCA (need %.2f%%)", 
+                float(price_drop * 100),
+                float(self.config.position_distance * 100)
+            )
+        
+        return False
+
+    def create_dca_order(self) -> Optional[OrderCandidate]:
+        """Create a DCA order when conditions are met."""
+        if not self.should_dca_down():
+            return None
+            
+        connector = self.connectors[self.config.exchange]
+        current_price = connector.get_price_by_type(
+            self.config.trading_pair, 
+            PriceType.MidPrice
+        )
+        
+        self.logger().info("Creating DCA market buy order at price %s", float(current_price))
+        return OrderCandidate(
+            trading_pair=self.config.trading_pair,
+            is_maker=False,  # Market order
+            order_type=OrderType.MARKET,
+            order_side=TradeType.BUY,
+            amount=self.config.order_amount,
+            price=current_price
+        )
