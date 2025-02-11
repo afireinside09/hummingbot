@@ -51,53 +51,77 @@ class SmartScalpingDCA(ScriptStrategyBase):
         self.positions = deque(maxlen=self.config.max_positions)
         self.maker_fee = Decimal("0.0006")  # 0.06%
         self.taker_fee = Decimal("0.0120")  # 1.20%
-        self.min_gas = Decimal("0.02")  # Minimum SOL to keep for gas
         self.logger().info("Strategy initialized with config: %s", vars(config))
         
     @classmethod
     def init_markets(cls, config: SmartScalpingDCAConfig):
         cls.markets = {config.exchange: {config.trading_pair}}
 
+    def has_active_sell_orders(self) -> bool:
+        """Check if there are any active sell orders and log them."""
+        active_orders = self.get_active_orders(connector_name=self.config.exchange)
+        active_sells = [o for o in active_orders if not o.is_buy]
+        
+        if active_sells:
+            self.logger().info("Active sell orders exist - letting them sit: %s", 
+                            [(o.trading_pair, float(o.price), float(o.quantity)) for o in active_sells])
+            return True
+        return False
+
+    def update_positions_from_balance(self) -> None:
+        """Update positions based on current balance and market price, only considering complete units."""
+        connector = self.connectors[self.config.exchange]
+        base_balance = connector.get_available_balance(self.config.trading_pair.split("-")[0])
+        
+        # Calculate complete units from balance
+        num_units = int(base_balance / self.config.order_amount)
+        usable_balance = num_units * self.config.order_amount
+        
+        if usable_balance == Decimal("0"):
+            if self.positions:
+                self.logger().info("No complete units in balance - clearing positions")
+                self.positions.clear()
+            return
+        
+        # Only update positions if balance has changed significantly
+        current_position_amount = sum(amount for _, amount in self.positions)
+        if abs(usable_balance - current_position_amount) > Decimal("1e-8"):
+            cost_basis = self.calculate_cost_basis()
+            if cost_basis:
+                self.positions.clear()
+                self.positions.append((cost_basis, usable_balance))
+                self.logger().info(f"Updated position with complete units: {usable_balance} @ {cost_basis}")
+                if base_balance > usable_balance:
+                    remainder = base_balance - usable_balance
+                    self.logger().info(f"Unused balance (less than order_amount): {remainder}")
+            else:
+                # If no cost basis found but we have balance, initialize with current price
+                current_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MidPrice)
+                self.positions.clear()
+                self.positions.append((current_price, usable_balance))
+                self.logger().info(f"Initialized position with complete units: {usable_balance} @ {current_price}")
+                if base_balance > usable_balance:
+                    remainder = base_balance - usable_balance
+                    self.logger().info(f"Unused balance (less than order_amount): {remainder}")
+        
+        self.logger().info("Current positions: %s", list(self.positions))
+
     def on_tick(self):
         if self.create_timestamp <= self.current_timestamp:
             self.logger().info("------- New Tick Started -------")
             
-            # Check for active sell orders first
-            active_orders = self.get_active_orders(connector_name=self.config.exchange)
-            active_sells = [o for o in active_orders if not o.is_buy]  # not is_buy means sell order
-            
-            if active_sells:
-                self.logger().info("Active sell orders exist - letting them sit: %s", 
-                                [(o.trading_pair, float(o.price), float(o.quantity)) for o in active_sells])
+            # Skip processing if there are active sell orders
+            if self.has_active_sell_orders():
                 self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
                 self.logger().info("Next tick scheduled for timestamp: %s", self.create_timestamp)
                 self.logger().info("------- Tick Completed (Skipped Due to Active Sells) -------\n")
                 return
             
-            # No active sells - proceed with normal tick processing
-            connector = self.connectors[self.config.exchange]
-            base_balance = connector.get_available_balance(self.config.trading_pair.split("-")[0])
-            
-            if base_balance == Decimal("0"):
-                if self.positions:
-                    self.logger().info("No balance found - clearing positions")
-                    self.positions.clear()
-            elif not self.positions:
-                # Initialize position with current balance and market price
-                current_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MidPrice)
-                self.positions.append((current_price, base_balance))
-                self.logger().info(f"Initialized position from balance: {base_balance} @ {current_price}")
-            elif abs(base_balance - sum(amount for _, amount in self.positions)) > Decimal("1e-8"):
-                # Balance changed - update position size
-                cost_basis = self.calculate_cost_basis()
-                if cost_basis:
-                    self.positions.clear()
-                    self.positions.append((cost_basis, base_balance))
-                    self.logger().info(f"Updated position to match balance: {base_balance} @ {cost_basis}")
-            
-            self.logger().info("Current positions: %s", list(self.positions))
+            # Update positions based on current balance
+            self.update_positions_from_balance()
             
             # Cancel only buy orders, since we know there are no sell orders at this point
+            active_orders = self.get_active_orders(connector_name=self.config.exchange)
             active_buys = [o for o in active_orders if o.is_buy]
             if active_buys:
                 self.logger().info("Cancelling %d active buy orders", len(active_buys))
@@ -197,7 +221,8 @@ class SmartScalpingDCA(ScriptStrategyBase):
 
     def create_proposal(self) -> List[OrderCandidate]:
         proposal = []
-        current_price = self.connectors[self.config.exchange].get_price_by_type(
+        connector = self.connectors[self.config.exchange]
+        current_price = connector.get_price_by_type(
             self.config.trading_pair, 
             PriceType.MidPrice
         )
@@ -234,43 +259,52 @@ class SmartScalpingDCA(ScriptStrategyBase):
                                 float(total_position_amount), float(self.config.order_amount))
             return proposal  # Return early - don't place buy orders while we have positions to sell
         
-        # Second priority: Place buy orders only if price has dropped enough
+        # Second priority: Place market buy orders when no positions exist
         if len(self.positions) < self.config.max_positions:
             # Check available balance for buying
-            connector = self.connectors[self.config.exchange]
-            base_balance = connector.get_available_balance(self.config.trading_pair.split("-")[0])
+            quote_balance = connector.get_available_balance(self.config.trading_pair.split("-")[1])
             
-            # Only proceed if we have enough balance for at least one order_amount plus gas
-            if base_balance >= (self.config.order_amount + self.min_gas):
-                lowest_price = None
-                if self.positions:
-                    lowest_price = min(price for price, _ in self.positions)
-                    target_buy_price = lowest_price * (Decimal("1") - self.config.position_distance)
-                    self.logger().info("Lowest position price: %s, target buy price: %s", 
-                                    float(lowest_price), float(target_buy_price))
-                else:
-                    target_buy_price = current_price * (Decimal("1") - self.config.position_distance)
-                    self.logger().info("No positions - target buy price: %s", float(target_buy_price))
-                
-                # Only place buy order if current price is at or below target price
-                if current_price <= target_buy_price:
-                    self.logger().info("Current price %s at or below target %s - creating buy order", 
-                                    float(current_price), float(target_buy_price))
+            # Only proceed if we have enough balance for at least one order_amount
+            required_quote = self.config.order_amount * current_price
+            if quote_balance >= required_quote:
+                if not self.positions:
+                    # No positions - place market buy order
+                    self.logger().info("No positions - creating market buy order at current price %s", 
+                                    float(current_price))
                     buy_order = OrderCandidate(
                         trading_pair=self.config.trading_pair,
-                        is_maker=True,
-                        order_type=OrderType.LIMIT,
+                        is_maker=False,  # Market order
+                        order_type=OrderType.MARKET,
                         order_side=TradeType.BUY,
                         amount=self.config.order_amount,
                         price=current_price
                     )
                     proposal.append(buy_order)
                 else:
-                    self.logger().info("Current price %s above target %s - no buy orders", 
-                                    float(current_price), float(target_buy_price))
+                    # Check if price has dropped enough for DCA
+                    highest_position_price = max(price for price, _ in self.positions)
+                    price_drop = (highest_position_price - current_price) / highest_position_price
+                    
+                    if price_drop >= self.config.position_distance:
+                        self.logger().info("Price dropped %.2f%% - creating DCA market buy order at %s", 
+                                        float(price_drop * 100), float(current_price))
+                        buy_order = OrderCandidate(
+                            trading_pair=self.config.trading_pair,
+                            is_maker=False,  # Market order
+                            order_type=OrderType.MARKET,
+                            order_side=TradeType.BUY,
+                            amount=self.config.order_amount,
+                            price=current_price
+                        )
+                        proposal.append(buy_order)
+                    else:
+                        self.logger().info("Price drop %.2f%% insufficient for DCA (need %.2f%%)", 
+                                        float(price_drop * 100), 
+                                        float(self.config.position_distance * 100))
             else:
-                self.logger().info("Insufficient balance %s for order amount %s plus gas %s", 
-                                float(base_balance), float(self.config.order_amount), float(self.min_gas))
+                self.logger().info("Insufficient quote balance %s (need %s) for order amount %s at price %s", 
+                                float(quote_balance), float(required_quote),
+                                float(self.config.order_amount), float(current_price))
 
         return proposal
 
