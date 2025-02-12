@@ -69,42 +69,89 @@ class SmartScalpingDCA(ScriptStrategyBase):
         return False
 
     def update_positions_from_balance(self) -> None:
-        """Update positions based on current balance and market price, only considering complete units."""
-        connector = self.connectors[self.config.exchange]
-        base_balance = connector.get_available_balance(self.config.trading_pair.split("-")[0])
+        """Update positions based on successful orders until last SELL."""
+        self.logger().debug("Starting position update from order history...")
+        self.logger().debug(f"Current positions before update: {list(self.positions)}")
         
-        # Calculate complete units from balance
-        num_units = int(base_balance / self.config.order_amount)
-        usable_balance = num_units * self.config.order_amount
+        # Get current balance from the strategy
+        balance_df = self.get_balance_df()
+        base_asset = self.config.trading_pair.split("-")[0]
+        self.logger().debug(f"Balance DataFrame:\n{balance_df}")
         
-        if usable_balance == Decimal("0"):
+        # Find the base asset balance for our exchange
+        asset_balance = balance_df[
+            (balance_df['Exchange'] == self.config.exchange) & 
+            (balance_df['Asset'] == base_asset)
+        ]
+        self.logger().debug(f"Found asset balance row:\n{asset_balance}")
+        
+        if asset_balance.empty:
+            self.logger().info(f"No balance found for {base_asset}")
             if self.positions:
-                self.logger().info("No complete units in balance - clearing positions")
+                self.logger().info("Clearing positions due to no balance")
+                self.positions.clear()
+            self.logger().debug("Exiting due to no balance found")
+            return
+            
+        base_balance = Decimal(str(asset_balance['Available Balance'].iloc[0]))
+        total_balance = Decimal(str(asset_balance['Total Balance'].iloc[0]))
+        self.logger().debug(f"Current balances for {base_asset}:")
+        self.logger().debug(f"  Available: {base_balance}")
+        self.logger().debug(f"  Total: {total_balance}")
+        self.logger().debug(f"  Locked in orders: {total_balance - base_balance}")
+        
+        # Get active orders to check for existing sell orders
+        active_orders = self.get_active_orders(connector_name=self.config.exchange)
+        self.logger().debug(f"Active orders found: {len(active_orders)}")
+        active_sells = [o for o in active_orders if not o.is_buy]
+        self.logger().debug(f"Active sell orders: {len(active_sells)}")
+        if active_sells:
+            self.logger().debug("Active sell orders exist - maintaining current positions:")
+            for order in active_sells:
+                self.logger().debug(f"  Sell order: {order.trading_pair} @ {order.price} for {order.quantity}")
+            return
+            
+        # If we have no active sell orders and no balance, clear positions
+        if base_balance == Decimal("0"):
+            self.logger().debug("No available balance found")
+            if self.positions:
+                self.logger().info("No balance and no active sells - clearing positions")
                 self.positions.clear()
             return
-        
-        # Only update positions if balance has changed significantly
-        current_position_amount = sum(amount for _, amount in self.positions)
-        if abs(usable_balance - current_position_amount) > Decimal("1e-8"):
-            cost_basis = self.calculate_cost_basis()
-            if cost_basis:
-                self.positions.clear()
-                self.positions.append((cost_basis, usable_balance))
-                self.logger().info(f"Updated position with complete units: {usable_balance} @ {cost_basis}")
-                if base_balance > usable_balance:
-                    remainder = base_balance - usable_balance
-                    self.logger().info(f"Unused balance (less than order_amount): {remainder}")
-            else:
-                # If no cost basis found but we have balance, initialize with current price
-                current_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MidPrice)
-                self.positions.clear()
+            
+        # If we have balance but no positions, initialize with current price
+        if not self.positions and base_balance > Decimal("0"):
+            self.logger().debug("No positions found but have balance - initializing new position")
+            connector = self.connectors[self.config.exchange]
+            current_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MidPrice)
+            self.logger().debug(f"Current market price: {current_price}")
+            
+            usable_balance = (base_balance // self.config.order_amount) * self.config.order_amount
+            self.logger().debug(f"Calculated usable balance: {usable_balance}")
+            self.logger().debug(f"Order amount: {self.config.order_amount}")
+            
+            if usable_balance > Decimal("0"):
                 self.positions.append((current_price, usable_balance))
-                self.logger().info(f"Initialized position with complete units: {usable_balance} @ {current_price}")
+                self.logger().info(f"Initialized new position: {usable_balance} @ {current_price}")
                 if base_balance > usable_balance:
                     remainder = base_balance - usable_balance
                     self.logger().info(f"Unused balance (less than order_amount): {remainder}")
+                    self.logger().debug(f"Remainder details: {float(remainder)} {base_asset}")
+            else:
+                self.logger().debug(f"Available balance {base_balance} too small for order amount {self.config.order_amount}")
         
-        self.logger().info("Current positions: %s", list(self.positions))
+        # Log final position state
+        if self.positions:
+            total_amount = sum(amount for _, amount in self.positions)
+            avg_price = sum(price * amount for price, amount in self.positions) / total_amount
+            self.logger().info(f"Current positions: {len(self.positions)} positions totaling {total_amount} @ avg {avg_price}")
+            self.logger().debug("Position details:")
+            for i, (price, amount) in enumerate(self.positions):
+                self.logger().debug(f"  Position {i+1}: {amount} @ {price}")
+        else:
+            self.logger().info("No positions to track")
+        
+        self.logger().debug(f"Final positions after update: {list(self.positions)}")
 
     def on_tick(self):
         if self.create_timestamp <= self.current_timestamp:
